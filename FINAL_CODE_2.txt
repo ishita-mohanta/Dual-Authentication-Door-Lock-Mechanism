@@ -1,0 +1,236 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Keypad.h>
+#include <Servo.h>
+#include <SPI.h>
+#include <MFRC522.h>
+
+// LCD Setup
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// Servo Motor (Pin D3) - Updated with better control
+Servo doorLockServo;
+#define SERVO_PIN 3
+#define SERVO_LOCKED_POS 20    // Adjusted locked position (experiment with values)
+#define SERVO_UNLOCKED_POS 80  // Adjusted unlocked position
+bool isDoorLocked = true;
+
+// Keypad Setup
+const byte ROWS = 4;
+const byte COLS = 3;
+char keys[ROWS][COLS] = {
+  {'1','2','3'},
+  {'4','5','6'},
+  {'7','8','9'},
+  {'*','0','#'}
+};
+byte rowPins[ROWS] = {5, 6, 7, 4};
+byte colPins[COLS] = {2, 9, 10};
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+// Password
+String correctPassword = "1234";
+String enteredPassword = "";
+
+// RFID Setup
+#define SS_PIN 8
+#define RST_PIN 9
+MFRC522 rfid(SS_PIN, RST_PIN);
+byte registeredUIDs[][4] = {{0x7B, 0xFD, 0xF7, 0x03}};
+int numRegisteredUIDs = sizeof(registeredUIDs)/sizeof(registeredUIDs[0]);
+
+// IR Sensor (Pin A2)
+#define IR_SENSOR_PIN A2
+int peopleCount = 0;
+bool objectDetected = false;
+#define DETECTION_TIMEOUT 10000  // 10 seconds
+
+// Auth Mode
+char authMode = '#';
+
+void setup() {
+  Serial.begin(9600);
+  
+  // Initialize Servo - Added servo test sequence
+  doorLockServo.attach(SERVO_PIN);
+  testServo(); // Test servo movement on startup
+  
+  // Initialize other components
+  lcd.init();
+  lcd.backlight();
+  SPI.begin();
+  rfid.PCD_Init();
+  pinMode(IR_SENSOR_PIN, INPUT_PULLUP);
+  
+  selectAuthMode();
+}
+
+void loop() {
+  if (authMode == '1') handleRFID();
+  else if (authMode == '2') handleKeypad();
+}
+
+// ===== Servo Test Sequence =====
+void testServo() {
+  Serial.println("Testing servo...");
+  doorLockServo.write(SERVO_LOCKED_POS);
+  delay(4000);
+  doorLockServo.write(SERVO_UNLOCKED_POS);
+  delay(4000);
+  doorLockServo.write(SERVO_LOCKED_POS);
+  Serial.println("Servo test complete");
+}
+
+// ===== Door Control Functions =====
+void lockDoor() {
+  doorLockServo.write(SERVO_LOCKED_POS);
+  isDoorLocked = true;
+  Serial.println("Door locked");
+}
+
+void unlockDoor() {
+  doorLockServo.write(SERVO_UNLOCKED_POS);
+  isDoorLocked = false;
+  Serial.println("Door unlocked");
+}
+
+// ===== Authentication Mode Selection =====
+void selectAuthMode() {
+  lcd.clear();
+  lcd.print("Select Mode:");
+  lcd.setCursor(0, 1);
+  lcd.print("1:RFID 2:Keypad");
+  
+  authMode = '0';
+  while (authMode != '1' && authMode != '2') {
+    authMode = keypad.getKey();
+    delay(10);
+  }
+  
+  lcd.clear();
+  if (authMode == '1') {
+    lcd.print("Scan your ID");
+    Serial.println("RFID mode activated");
+  } else {
+    lcd.print("Enter Password");
+    Serial.println("Keypad mode activated");
+  }
+}
+
+// ===== Keypad Handling =====
+void handleKeypad() {
+  char key = keypad.getKey();
+  if (!key) return;
+  
+  Serial.print("Key pressed: "); Serial.println(key);
+  
+  if (key == '#') { // Submit password
+    if (enteredPassword == correctPassword) {
+      grantAccess();
+    } else {
+      denyAccess();
+    }
+    enteredPassword = "";
+  } 
+  else if (key == '*') { // Clear input
+    enteredPassword = "";
+    lcd.clear();
+    lcd.print("Enter Password");
+  } 
+  else { // Password entry
+    enteredPassword += key;
+    lcd.setCursor(enteredPassword.length()-1, 1);
+    lcd.print('*');
+  }
+}
+
+// ===== RFID Handling =====
+void handleRFID() {
+  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return;
+  
+  Serial.print("Scanned UID:");
+  bool accessGranted = false;
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    Serial.print(rfid.uid.uidByte[i] < 0x10 ? " 0" : " ");
+    Serial.print(rfid.uid.uidByte[i], HEX);
+    
+    // Check against registered UIDs
+    for (int j = 0; j < numRegisteredUIDs; j++) {
+      if (memcmp(rfid.uid.uidByte, registeredUIDs[j], 4) == 0) {
+        accessGranted = true;
+        break;
+      }
+    }
+  }
+  Serial.println();
+  
+  if (accessGranted) {
+    grantAccess();
+  } else {
+    denyAccess();
+  }
+  
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+}
+
+// ===== IR Sensor People Counting =====
+bool waitForPerson() {
+  lcd.clear();
+  lcd.print("Waiting for...");
+  lcd.setCursor(0, 1);
+  lcd.print("person to pass");
+
+  unsigned long startTime = millis();
+  while (millis() - startTime < DETECTION_TIMEOUT) {
+    int irState = digitalRead(IR_SENSOR_PIN);
+    
+    if (irState == LOW && !objectDetected) {
+      // Person detected
+      objectDetected = true;
+      peopleCount++;
+      Serial.print("Person detected! Total: ");
+      Serial.println(peopleCount);
+      
+      lcd.clear();
+      lcd.print("Person entered!");
+      lcd.setCursor(0, 1);
+      lcd.print("Total: ");
+      lcd.print(peopleCount);
+      
+      delay(1000); // Debounce
+      return true;
+    } 
+    else if (irState == HIGH && objectDetected) {
+      objectDetected = false;
+    }
+    delay(50);
+  }
+  
+  lcd.clear();
+  lcd.print("Timeout!");
+  delay(1000);
+  return false;
+}
+
+// ===== Access Control =====
+void grantAccess() {
+  unlockDoor();
+  lcd.clear();
+  lcd.print("Access granted!");
+  Serial.println("Access granted - door unlocked");
+  
+  // Wait for person to pass
+  waitForPerson();
+  
+  lockDoor();
+  selectAuthMode();
+}
+
+void denyAccess() {
+  lcd.clear();
+  lcd.print("Access denied!");
+  Serial.println("Access denied");
+  delay(2000);
+  selectAuthMode();
+}
